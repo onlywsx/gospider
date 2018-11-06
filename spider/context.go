@@ -1,10 +1,12 @@
 package spider
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -23,6 +25,7 @@ type Context struct {
 	ctlCtx    context.Context
 	ctlCancel context.CancelFunc
 
+	collyContext *colly.Context
 	// output
 	outputDB *sql.DB
 }
@@ -55,44 +58,68 @@ func (ctx *Context) setOutputDB(db *sql.DB) {
 }
 
 func (ctx *Context) GetRequest() *Request {
-	collyReq := ctx.ctlCtx.Value("req").(*colly.Request)
-	return newRequest(collyReq, ctx)
+	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
+		return newRequest(req, ctx)
+	}
+	return nil
 }
 
 func (ctx *Context) Retry() error {
-	return ctx.ctlCtx.Value("req").(*colly.Request).Retry()
+	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
+		return req.Retry()
+	}
+
+	return nil
 }
 
 func (ctx *Context) PutReqContextValue(key string, value interface{}) {
-	ctx.ctlCtx.Value("req").(*colly.Request).Ctx.Put(key, value)
+	if ctx.collyContext == nil {
+		if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
+			ctx.collyContext = req.Ctx
+		} else {
+			ctx.collyContext = colly.NewContext()
+		}
+	}
+	ctx.collyContext.Put(key, value)
 }
 
 func (ctx *Context) GetReqContextValue(key string) string {
-	return ctx.ctlCtx.Value("req").(*colly.Request).Ctx.Get(key)
+	if ctx.collyContext == nil {
+		if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
+			ctx.collyContext = req.Ctx
+		} else {
+			return ""
+		}
+	}
+	return ctx.collyContext.Get(key)
 }
 
 func (ctx *Context) GetAnyReqContextValue(key string) interface{} {
-	return ctx.ctlCtx.Value("req").(*colly.Request).Ctx.GetAny(key)
+	if ctx.collyContext == nil {
+		if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
+			ctx.collyContext = req.Ctx
+		} else {
+			return nil
+		}
+	}
+	return ctx.collyContext.GetAny(key)
 }
 
 func (ctx *Context) Visit(URL string) error {
-	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
-		return ctx.c.Visit(req.AbsoluteURL(URL))
-	}
-	return ctx.c.Visit(URL)
+	return ctx.c.Visit(ctx.AbsoluteURL(URL))
 }
 
 func (ctx *Context) VisitForNext(URL string) error {
-	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
-		return ctx.nextC.Visit(req.AbsoluteURL(URL))
-	}
-	return ctx.nextC.Visit(URL)
+	return ctx.nextC.Visit(ctx.AbsoluteURL(URL))
 }
 
 func (ctx *Context) reqContextClone() *colly.Context {
 	newCtx := colly.NewContext()
-	req := ctx.ctlCtx.Value("req").(*colly.Request)
-	req.Ctx.ForEach(func(k string, v interface{}) interface{} {
+	if ctx.collyContext == nil {
+		return newCtx
+	}
+
+	ctx.collyContext.ForEach(func(k string, v interface{}) interface{} {
 		newCtx.Put(k, v)
 		return nil
 	})
@@ -101,20 +128,27 @@ func (ctx *Context) reqContextClone() *colly.Context {
 }
 
 func (ctx *Context) VisitForNextWithContext(URL string) error {
-	req := ctx.ctlCtx.Value("req").(*colly.Request)
-	return ctx.nextC.Request("GET", req.AbsoluteURL(URL), nil, ctx.reqContextClone(), nil)
+	return ctx.nextC.Request("GET", ctx.AbsoluteURL(URL), nil, ctx.reqContextClone(), nil)
 }
 
 func (ctx *Context) Post(URL string, requestData map[string]string) error {
-	return ctx.c.Post(URL, requestData)
+	return ctx.c.Post(ctx.AbsoluteURL(URL), requestData)
 }
 
 func (ctx *Context) PostForNext(URL string, requestData map[string]string) error {
-	return ctx.nextC.Post(URL, requestData)
+	return ctx.nextC.Post(ctx.AbsoluteURL(URL), requestData)
+}
+
+func (ctx *Context) PostForNextWithContext(URL string, requestData map[string]string) error {
+	return ctx.nextC.Request("POST", ctx.AbsoluteURL(URL), createFormReader(requestData), ctx.reqContextClone(), nil)
 }
 
 func (ctx *Context) PostRawForNext(URL string, requestData []byte) error {
-	return ctx.nextC.PostRaw(URL, requestData)
+	return ctx.nextC.PostRaw(ctx.AbsoluteURL(URL), requestData)
+}
+
+func (ctx *Context) PostRawForNextWithContext(URL string, requestData []byte) error {
+	return ctx.nextC.Request("POST", ctx.AbsoluteURL(URL), bytes.NewReader(requestData), ctx.reqContextClone(), nil)
 }
 
 func (ctx *Context) Request(method, URL string, requestData io.Reader, hdr http.Header) error {
@@ -138,15 +172,22 @@ func (ctx *Context) PostMultipartForNext(URL string, requestData map[string][]by
 }
 
 func (ctx *Context) SetResponseCharacterEncoding(encoding string) {
-	ctx.ctlCtx.Value("req").(*colly.Request).ResponseCharacterEncoding = encoding
+	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
+		req.ResponseCharacterEncoding = encoding
+	}
 }
 
 func (ctx *Context) AbsoluteURL(u string) string {
-	return ctx.ctlCtx.Value("req").(*colly.Request).AbsoluteURL(u)
+	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
+		return req.AbsoluteURL(u)
+	}
+	return u
 }
 
 func (ctx *Context) Abort() {
-	ctx.ctlCtx.Value("req").(*colly.Request).Abort()
+	if req, ok := ctx.ctlCtx.Value("req").(*colly.Request); ok {
+		req.Abort()
+	}
 }
 
 func (ctx *Context) Output(row map[int]interface{}, namespace ...string) error {
@@ -236,4 +277,12 @@ func quoteQuery(sql string) (s string, err error) {
 	fields := strings.Replace(matches[2], ",", "`,`", -1)
 	s = matches[1] + "`" + fields + "`" + matches[3]
 	return
+}
+
+func createFormReader(data map[string]string) io.Reader {
+	form := url.Values{}
+	for k, v := range data {
+		form.Add(k, v)
+	}
+	return strings.NewReader(form.Encode())
 }
